@@ -1,0 +1,1252 @@
+<?php
+/************************************************************************************************
+| I utilize a file that opens the database, runs the query, and closes the database.
+| Additionally, I have a $_SESSION array I utilize.
+| This file is included in the places I use it, and relies on an $EntityFK var to be set before calling
+| The file begins by ensuring we have a valid access token.
+|
+ ****************************************************************************************************/
+
+
+/**************************** get a valid access token ***************************************************************************/
+// grab the contact and token data
+$SQLQuery = "SELECT
+                gc.GoogleContactID,
+                CASE
+                    WHEN (UNIX_TIMESTAMP(UserAccessTokenExp) - UNIX_TIMESTAMP(NOW())) > 0 THEN 'Access'
+                    WHEN UserRefreshToken IS NOT NULL THEN 'Refresh'
+                    ELSE 'None'
+                    END AS 'tokenType',
+
+                CASE
+                    WHEN (UNIX_TIMESTAMP(UserAccessTokenExp) - UNIX_TIMESTAMP(NOW())) > 0 THEN UserAccessToken
+                    WHEN UserRefreshToken IS NOT NULL THEN UserRefreshToken
+                    ELSE 'None'
+                    END AS 'token'
+             FROM tbluser u
+             LEFT JOIN googledata gd ON u.UserPK = gd.UserFK
+             LEFT JOIN googlecontact gc ON u.UserPK = gc.UserFK AND gc.EntityFK = '{$EntityFK}'
+             WHERE isDel = 0 AND UserPK = {$_SESSION['UserID']}
+";
+
+include $applicationRoot . 'SQLQuery.php';
+
+$accessToken = '';
+$GoogleContactID = '';
+while($row = mysql_fetch_array($result)){
+    $tokenData = $row;
+    if(strlen($row['GoogleContactID']) > 0){
+        // if we received results, then update our GoogleContactID var
+        $GoogleContactID = $row['GoogleContactID'];
+    }
+}
+
+// if this is a new entity, we'll need to pull the passed in googlecontactid from the POST if it isn't 0
+if(strlen($_POST['GoogleContactID']) > 0 & $_POST['GoogleContactID'] != "0"){
+    $GoogleContactID = $_POST['GoogleContactID'];
+
+    // then add a record to our DB for their GoogleContactID
+    $SQLQuery = "INSERT INTO googlecontact (UserFK,EntityFK,GoogleContactID) VALUES
+                             ({$_SESSION['UserID']},{$EntityFK},'{$GoogleContactID}')";
+    include $applicationRoot . 'SQLQuery.php';
+}
+
+// if we have a valid access token
+if($tokenData['tokenType'] == 'Access'){
+    // set $accessToken to our access token
+    $accessToken = $tokenData['token'];
+}
+
+// if we only have a refresh token
+elseif($tokenData['tokenType'] == 'Refresh'){
+    // grab a new access token
+    $accessToken = obtainNewToken($tokenData['token'],$tokenData['UserPK']);
+}
+
+// if we have an entityfk, set our contactInfo array
+if(strlen($EntityFK) > 0){
+    $SQLQuery = "SELECT EntityPK, FirstName, LastName, HomePhone, WorkPhone, MobilePhone, FaxNumber, Email1, Email2,
+                    LastModified, CompanyName, JobTitle
+                 FROM entity e JOIN person p ON e.EntityPK = p.EntityFK
+                 LEFT JOIN company c ON p.EmployerCompanyFK = c.CompanyPK
+                 WHERE EntityPK = {$EntityFK}";
+    include $applicationRoot . "SQLQuery.php";
+
+    $contactInfo = array();
+    while($row = mysql_fetch_array($result)){
+        // create our contactInfo array
+        $contactInfo['EntityPK']          = $EntityFK;
+        $contactInfo['LastModified']      = $row['LastModified'];
+        $contactInfo['FirstName']         = $row['FirstName'];
+        $contactInfo['LastName']          = $row['LastName'];
+        $contactInfo['WorkPhone']         = $row['WorkPhone'];
+        $contactInfo['FaxNumber']         = $row['FaxNumber'];
+        $contactInfo['HomePhone']         = $row['HomePhone'];
+        $contactInfo['MobilePhone']       = $row['MobilePhone'];
+        $contactInfo['Email1']            = $row['Email1'];
+        $contactInfo['Email2']            = $row['Email2'];
+        $contactInfo['EmployerCompanyFK'] = $row['EmployerCompanyFK'];
+        $contactInfo['CompanyName']       = $row['CompanyName'];
+        $contactInfo['JobTitle']          = $row['JobTitle'];
+        $contactInfo['GoogleContactID']   = $GoogleContactID;
+    }
+}
+
+/*********************************************** logic ***************************************************************************/
+
+// if we came here from an ajax call, with the purpose to generate radio buttons ////////////////////////////
+if($ajaxGetSimilar){
+    // our contactInfo array was created in the calling file
+    $similarContacts = getSimilarContacts($accessToken,$contactInfo);
+
+    $returnMessage = '';
+    // scroll through our found similar contacts and create our radio buttons to return
+    foreach($similarContacts AS $similarContact){
+        $returnMessage .= "
+            <tr>
+                <td class='FormLabel' id='{$similarContact['GoogleContactID']}_label' align='right' valign='top'>
+
+                <td class='top'>
+                    <input type='radio' name='SimilarContact' value='{$similarContact['GoogleContactID']}' class='FormField'>
+                    <b>{$similarContact['Title']}</b>  ({$similarContact['Item']['Value']})
+                    <font class='FormNotation'>&nbsp;&nbsp;&nbsp;</font>
+                </td>
+            </tr>
+
+        ";
+    }
+
+    echo $returnMessage;
+}
+
+// if we came here through a post
+if($postSyncContact) {
+    /**********************************************************************************************************************
+    | Here are the scenarios this part of the form handles
+    |  1) We have an existing Person
+    |    a) We have a GoogleContactID and are running the update function
+    |    b) The user chose a radio button of an existing contact,
+    |       and we are inserting a GoogleContactID record and then running the update function
+    |    c) The radio button "None" was chosen, and we are running the create function, as well
+    |       as updating our record
+    |  2) We are creating a new person
+    |    a) Redirect to the person_form with the selected SimilarContact value, defaulted to 0
+     ***********************************************************************************************************************/
+
+    // triple check that we have an access token before proceeding
+    if(strlen($accessToken) > 0){
+        // first see if we had an Entity PK
+        if(strlen($contactInfo['EntityPK']) > 0){
+            // if so, see if we already had a GoogleContactID for them
+            if(strlen($GoogleContactID) > 0){
+                // if so, run the update process
+                // first, add the base GoogleContactID to our contactInfo array
+                # this should already be set
+                #$contactInfo['GoogleContactID'] = $_POST['GoogleContactID'];
+
+                // next get all of their data.  if we don't resend any data types they already have, they get deleted
+                // (ie, If they have a birthday and we don't send one back, it gets deleted)
+                $googleContactInfo = getSingleContact($accessToken,$contactInfo['GoogleContactID']);
+
+                // TODO - handle scenario where they deleted a contact that we have an ID for
+
+                // then use it in our update function
+                updateContact($accessToken,$googleContactInfo,$contactInfo);
+            } else {
+                // if we don't have a GoogleContactID, then we need to look at SimilarContact
+                // if user chose a similar contact
+                if(strlen($_POST['SimilarContact']) > 0){
+                    // this means we have a Person and a GoogleContact, but they aren't synced
+                    // first update our DB with their base GoogleContactID
+                    $SQLQuery = "INSERT INTO googlecontact (UserFK,EntityFK,GoogleContactID) VALUES
+                             ({$_SESSION['UserID']},{$contactInfo['EntityPK']},'{$_POST['SimilarContact']}')";
+                    include $applicationRoot . 'SQLQuery.php';
+
+                    // run the update process
+                    // first, add the base GoogleContactID to our contactInfo array
+                    $contactInfo['GoogleContactID'] = $_POST['SimilarContact'];
+
+                    // next get all of their data.  if we don't resend any data types they already have, they get deleted
+                    // (ie, If they have a birthday and we don't send one back, it gets deleted)
+                    $googleContactInfo = getSingleContact($accessToken,$_POST['SimilarContact']);
+
+                    // then use it in our update function
+                    updateContact($accessToken,$googleContactInfo,$contactInfo);
+                } else {
+                    // if we do not have a GoogleContactID or a SimilarContact selected, then create a new Google Contact
+                    $googleContactInfo = createContact($accessToken,$contactInfo);
+
+                    // find the base ID from the returned array
+                    $basePos = strpos($googleContactInfo['entry']['id']['$t'],'base/') + 5;
+                    $baseID = substr($googleContactInfo['entry']['id']['$t'],$basePos);
+
+                    // create a new googlecontact entry with this base id for this user for this Person
+                    $SQLQuery = "INSERT INTO googlecontact (UserFK,EntityFK,GoogleContactID) VALUES
+                             ({$_SESSION['UserID']},{$contactInfo['EntityPK']},'{$baseID}')";
+                    include $applicationRoot . 'SQLQuery.php';
+                }
+            }
+
+            // because we have an entity fk, set the redirect to the person dash
+            $FormRedirect = "index.php?page=person_dash&persondash_form_id={$contactInfo['EntityPK']}";
+
+            // if we came here from the person dash ajax button, echo out the redirect URL
+            if($personDashButton){
+                echo "index.php?page=person_dash&persondash_form_id={$contactInfo['EntityPK']}&Message=Contact successfully synced.";
+            }
+        } else {
+            // if we don't have an Entity PK, then all we need to do is redirect to the
+            // person form with the selected GoogleContactID (or 0, if None was selected)
+
+            $GoogleContactID = 0;
+            if(strlen($_POST['GoogleContactID']) > 0){
+                $GoogleContactID = $_POST['GoogleContactID'];
+            } elseif(strlen($_POST['SimilarContact']) > 0){
+                $GoogleContactID = $_POST['SimilarContact'];
+            }
+
+            $FormRedirect = "index.php?page=person_form&GoogleContactID={$GoogleContactID}&Message=Complete the form below and click save to import this contact.";
+        }
+
+    } else {
+        // if we somehow didn't have an access token
+        // TODO - add logic here
+    }
+}
+
+// if we're adding a new person using google contact info
+if($addNewPerson){
+    // if our GoogleContactID is not 0
+    if(strlen($_GET['GoogleContactID']) > 1){
+
+        $googleContactInfo = getSingleContact($accessToken,$_GET['GoogleContactID']);
+
+        if(strlen($googleContactInfo['entry']['title']['$t']) > 0){
+            // split the title into First Name and Last Name
+            $firstLast = firstLast($googleContactInfo['entry']['title']['$t']);
+        }
+
+        $WorkPhone = $FaxNumber = $HomePhone = $MobilePhone = "";
+        foreach($googleContactInfo['entry']['gd$phoneNumber'] AS $googleContactNumber){
+            // work
+            if(strpos($googleContactNumber['rel'],'#work') !== false & strpos($googleContactNumber['rel'],'#work_fax') === false & strlen($WorkPhone) < 1) {
+                $WorkPhone = $googleContactNumber['$t'];
+            }
+
+            // fax
+            if(strpos($googleContactNumber['rel'],'#work_fax') !== false & strlen($FaxNumber) < 1){
+                $FaxNumber = $googleContactNumber['$t'];
+            }
+
+            // home
+            if(strpos($googleContactNumber['rel'],'#home') !== false & strpos($googleContactNumber['rel'],'#home_fax') === false & strlen($HomePhone) < 1){
+                $HomePhone = $googleContactNumber['$t'];
+            }
+
+            // mobile
+            if(strpos($googleContactNumber['rel'],'#mobile') !== false & strlen($MobilePhone) < 1){
+                $MobilePhone .= $googleContactNumber['$t'];
+            }
+        }
+
+        // set our variables.  it's okay if they're blank.
+        echo "
+            <script>
+                $('#FirstName').val('{$firstLast['FirstName']}');
+                $('#FirstName_display').val('{$firstLast['FirstName']}');
+                $('#LastName').val('{$firstLast['LastName']}');
+                $('#LastName_display').val('{$firstLast['LastName']}');
+                $('#Email1').val('". $googleContactInfo['entry']['gd$email'][0]['address'] ."');
+                $('#Email1_display').val('". $googleContactInfo['entry']['gd$email'][0]['address'] ."');
+                $('#Email2').val('". $googleContactInfo['entry']['gd$email'][1]['address'] ."');
+                $('#Email2_display').val('". $googleContactInfo['entry']['gd$email'][1]['address'] ."');
+                $('#WorkPhone').val('{$WorkPhone}');
+                $('#WorkPhone_display').val('{$WorkPhone}');
+                $('#FaxNumber').val('{$FaxNumber}');
+                $('#HomePhone').val('{$HomePhone}');
+                $('#HomePhone_display').val('{$HomePhone}');
+                $('#MobilePhone').val('{$MobilePhone}');
+                $('#MobilePhone_display').val('{$MobilePhone}');
+                $('#GoogleSync').val(1);
+                $('#GoogleSync_checkbox').val(1).prop('checked',true).prop('disabled',true);
+            </script>
+        ";
+    }
+}
+
+
+/****************************** functions *****************************************************************************************/
+
+function obtainNewToken($refreshToken,$UserFK){
+    // tell the function we're using global vars
+    global $google_API_client_id;
+    global $google_API_client_secret;
+
+    // set our post vars
+    $url = "https://www.googleapis.com/oauth2/v4/token";
+    $fields = array(
+        'client_id'     => urlencode($google_API_client_id),
+        'client_secret' => urlencode($google_API_client_secret),
+        'refresh_token' => urlencode($refreshToken),
+        'grant_type'    => urlencode('refresh_token')
+    );
+
+    //url-ify the data for the POST
+    $fields_string = '';
+    foreach($fields as $key=>$value) { $fields_string .= $key.'='.$value.'&'; }
+    $fields_string = rtrim($fields_string, '&');
+
+    // open connection
+    $curl = curl_init();
+
+    // set the url, number of POST vars, POST data
+    curl_setopt($curl,CURLOPT_URL,$url);
+    curl_setopt($curl,CURLOPT_POST,count($fields));
+    curl_setopt($curl,CURLOPT_POSTFIELDS,$fields_string);
+
+    // this let's us put the results into a variable ($curlResult)
+    curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+    // if it goes longer than 3 seconds, kill it
+    curl_setopt($curl, CURLOPT_TIMEOUT, '3');
+    // this turns off ssl thingy, which breaks our current post when left on
+    curl_setopt($curl, CURLOPT_SSL_VERIFYPEER, 0);
+    // our header vars, as described on section 4 of https://developers.google.com/identity/protocols/OpenIDConnect#server-flow
+    curl_setopt($curl, CURLOPT_HTTPHEADER, array(
+        'Host: www.googleapis.com',
+        'Content-Type: application/x-www-form-urlencoded'
+    ));
+
+    // execute post
+    $curlResult = curl_exec($curl);
+
+    // translate the results into an object
+    $curlObjArray = json_decode($curlResult);
+    //then that object into an array we can read from
+    $curlArray = json_decode(json_encode($curlObjArray),True);
+
+    // record the curl status
+    $http_status = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+    // and close the request
+    curl_close($curl);
+
+    // add our new token to the newTokenArray
+    $newTokenArray[$UserFK] = $curlArray['access_token'];
+
+    // TODO : handle errors //////////////////////////////////
+
+    return $curlArray['access_token'];
+}
+
+function getSingleContact($accessToken,$GoogleContactID){
+    // https://developers.google.com/google-apps/contacts/v3/#retrieving_a_single_contact
+
+    // tell the function we're using global vars
+    global $google_API_client_id;
+    global $google_API_client_secret;
+
+    // pull the contact
+    $url = "https://www.google.com/m8/feeds/contacts";
+
+    // append our user's email
+    $UserEmail = urlencode($_SESSION['UserEmail']);
+    $url .= "/{$UserEmail}";
+
+    // we want all data,
+    $url .= '/full';
+
+    // get position of "base/" if it's in the id (won't be if we pulled it from the DB)
+    if(strpos($GoogleContactID,'base/') !== false){
+        $basePos = strpos($GoogleContactID,'base/') + 5;
+        $baseID = substr($GoogleContactID,$basePos);
+        $GoogleContactID = $baseID;
+    }
+
+    // append the ID
+    $url .= "/{$GoogleContactID}";
+
+    // in JSON
+    $url .= '?alt=json';
+
+    // append our access token
+    $url .="&access_token={$accessToken}";
+
+    // open connection
+    $curl = curl_init();
+
+    // set our GET vars
+    curl_setopt($curl,CURLOPT_URL,$url);
+    // this let's us put the results into a variable ($curlResult)
+    curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+    // if it goes longer than 3 seconds, kill it, with fire
+    curl_setopt($curl, CURLOPT_TIMEOUT, '3');
+    // this turns off ssl thingy, which breaks our current post when left on
+    curl_setopt($curl, CURLOPT_SSL_VERIFYPEER, 0);
+
+    // execute get request
+    $curlResult = curl_exec($curl);
+
+    curl_close($curl);
+
+    // translate the results into an object
+    $curlObjArray = json_decode($curlResult);
+    //then that object into an array we can read from
+    $curlArray = json_decode(json_encode($curlObjArray),True);
+
+    return $curlArray;
+}
+
+function getSimilarContacts($accessToken,$contactInfo){
+    // pull the contact
+    $url = "https://www.google.com/m8/feeds/contacts";
+
+    // append our user's email
+    $UserEmail = urlencode($_SESSION['UserEmail']);
+    $url .= "/{$UserEmail}";
+
+    // we want all data, in JSON, with a maximum 100,000 results (default is 25 otherwise...)
+    $url .= '/full?alt=json&max-results=100000';
+
+    // append our access token
+    $url .="&access_token={$accessToken}";
+
+    // open connection
+    $curl = curl_init();
+
+    // set our GET vars
+    curl_setopt($curl,CURLOPT_URL,$url);
+    // this let's us put the results into a variable ($curlResult)
+    curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+    // if it goes longer than 3 seconds, kill it, with fire
+    curl_setopt($curl, CURLOPT_TIMEOUT, '3');
+    // this turns off ssl thingy, which breaks our current post when left on
+    curl_setopt($curl, CURLOPT_SSL_VERIFYPEER, 0);
+
+    // execute get request
+    $curlResult = curl_exec($curl);
+
+    curl_close($curl);
+
+    // translate the results into an object
+    $curlObjArray = json_decode($curlResult);
+    //then that object into an array we can read from
+    $curlArray = json_decode(json_encode($curlObjArray),True);
+
+    $contactMatchArray = array();
+
+    // here, we need to sort through our results and only return an array of similar matches, if any
+    foreach($curlArray['feed']['entry'] AS $googleContactEntry){
+        // only do the logic if there is a title
+        if(strlen($googleContactEntry['title']['$t']) > 0){
+            // split the name ("title") into a First and Last name
+            $firstLast = firstLast($googleContactEntry['title']['$t']);
+
+            // if we are missing either first or last, "continue" to the next iteration of the loop
+            if(strlen($firstLast['FirstName']) < 1 | strlen($firstLast['LastName']) < 1){
+                continue;
+            }
+
+            // add the base id to the array
+            $basePos = strpos($googleContactEntry['id']['$t'],'base/') + 5;
+            $baseID = substr($googleContactEntry['id']['$t'],$basePos);
+
+            // see if their 'title' is like the last name
+            $foundMatch = false;
+            if(strpos(baseString($googleContactEntry['title']['$t']),baseString($contactInfo['LastName'])) !== false){
+                // if so, check for a matching phone number
+                foreach($googleContactEntry['gd$phoneNumber'] AS $googleContactPhone){
+                    // see if their base number is like our base number (in case they have 15039135742 and we have 5039135742, for example)
+                    // we are checking work, home, and mobile
+                    if(strlen($contactInfo['WorkPhone']) > 0){
+                        if(strpos(basePhone($googleContactPhone['$t']),basePhone($contactInfo['WorkPhone'])) !== false){
+                            $contactMatchArray[] = array(
+                                'GoogleContactID' => $baseID,
+                                'Title' => $googleContactEntry['title']['$t'],
+                                'Item' => array(
+                                    'Key' => 'Phone',
+                                    'Value' => $googleContactPhone['$t']
+                                )
+                            );
+                            $foundMatch = true;
+
+                            // break after finding the first matching number
+                            break;
+                        }
+                    }
+
+                    if(strlen($contactInfo['HomePhone']) > 0){
+                        if(strpos(basePhone($googleContactPhone['$t']),basePhone($contactInfo['HomePhone'])) !== false){
+                            $contactMatchArray[] = array(
+                                'GoogleContactID' => $baseID,
+                                'Title' => $googleContactEntry['title']['$t'],
+                                'Item' => array(
+                                    'Key' => 'Phone',
+                                    'Value' => $googleContactPhone['$t']
+                                )
+                            );
+                            $foundMatch = true;
+
+                            // break after finding the first matching number
+                            break;
+                        }
+                    }
+
+                    if(strlen($contactInfo['MobilePhone']) > 0){
+                        if(strpos(basePhone($googleContactPhone['$t']),basePhone($contactInfo['MobilePhone'])) !== false){
+                            $contactMatchArray[] = array(
+                                'GoogleContactID' => $baseID,
+                                'Title' => $googleContactEntry['title']['$t'],
+                                'Item' => array(
+                                    'Key' => 'Phone',
+                                    'Value' => $googleContactPhone['$t']
+                                )
+                            );
+                            $foundMatch = true;
+
+                            // break after finding the first matching number
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // if we haven't already found a last name / phone number combination
+            if(!$foundMatch){
+                foreach($googleContactEntry['gd$email'] AS $googleContactEmail){
+                    // if we have an email 1
+                    if(strlen($contactInfo['Email1']) > 0){
+                        if($googleContactEmail['address'] == $contactInfo['Email1']){
+                            $contactMatchArray[] = array(
+                                'GoogleContactID' => $baseID,
+                                'Title' => $googleContactEntry['title']['$t'],
+                                'Item' => array(
+                                    'Key' => 'Email',
+                                    'Value' => $googleContactEmail['address']
+                                )
+                            );
+
+                            // break after finding the first matching email
+                            break;
+                        }
+                    }
+                    // if we have an email 2
+                    // in the off chance that email1 and email2 are the same, just use email2
+                    if(strlen($contactInfo['Email2']) > 0){
+                        if($googleContactEmail['address'] == $contactInfo['Email2']){
+                            $contactMatchArray[] = array(
+                                'GoogleContactID' => $baseID,
+                                'Title' => $googleContactEntry['title']['$t'],
+                                'Item' => array(
+                                    'Key' => 'Email',
+                                    'Value' => $googleContactEmail['address']
+                                )
+                            );
+
+                            // break after finding the first matching email
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return $contactMatchArray;
+}
+
+function createContact($accessToken,$contactInfo){
+    GLOBAL $google_API_client_id;
+    GLOBAL $google_API_client_secret;
+
+    //https://developers.google.com/google-apps/contacts/v3/#creating_contacts
+    $url = "https://www.google.com/m8/feeds/contacts";
+
+    // append our user's email
+    $UserEmail = urlencode($_SESSION['UserEmail']);
+    $url .= "/{$UserEmail}";
+    $url .= "/full";
+
+    // set our base array, and we'll add to it as we analyze our person data
+    $fields = array(
+        'version' => '1.0',
+        'encoding' => 'UTF-8',
+        'entry' => array(
+            'category' => array(
+                'scheme' => 'http://schemas.google.com/g/2005#kind',
+                'term'   => 'http://schemas.google.com/contact/2008#contact'
+            ),
+            'gd$name' => array(
+                'gd$givenName'  => array(
+                    '$t' => $contactInfo['FirstName']
+                ),
+                'gd$familyName' => array(
+                    '$t' => $contactInfo['LastName']
+                ),
+                'gd$fullName'   => array(
+                    '$t' => $contactInfo['FirstName'] . " " . $contactInfo['LastName']
+                )
+            )
+        ),
+        'xmlns' => 'http://www.w3.org/2005/Atom',
+        'xmlns$batch' => 'http://schemas.google.com/gdata/batch',
+        'xmlns$gContact' => 'http://schemas.google.com/contact/2008',
+        'xmlns$gd' => 'http://schemas.google.com/g/2005'
+    );
+
+    /******************** fields - organization ********************/
+    // set a blank array to begin
+    $createOrganizationArray = array();
+
+    // check if we have a company
+    if(strlen($contactInfo['CompanyName']) > 0){
+        // if so, add the proper array to our createOrganizationArray
+        $createOrganizationArray[] = array(
+            'rel' => 'http://schemas.google.com/g/2005#other',
+            'gd$orgName' => array(
+                '$t' => $contactInfo['CompanyName']
+            )
+        );
+    }
+
+    // check if we have a job title
+    if(strlen($contactInfo['JobTitle']) > 0){
+        // if so, add the proper array to our createOrganizationArray
+        $createOrganizationArray[0]['gd$orgTitle'] = array(
+            '$t' => $contactInfo['JobTitle']
+        );
+    }
+
+    // if we had any org data
+    if(count($createOrganizationArray) > 0){
+        // add it to our base fields array
+        $fields['entry']['gd$organization'] = $createOrganizationArray;
+    }
+
+
+
+    /**************** fields - email *************************/
+    // set a blank array to begin
+    $createEmailArray = array();
+    $EmailOnePrimary = false;
+
+    // default email1 to work and email2 to home.  if they update them on google, they won't be overwritten on update
+    // check if we have an Email1
+    if(strlen($contactInfo['Email1']) > 0){
+        // if so, add the proper array to our createEmailArray
+        $createEmailArray[] = array(
+            'address' => $contactInfo['Email1'],
+            'primary' => 'true',
+            'rel'     => 'http://schemas.google.com/g/2005#work'
+        );
+        $EmailOnePrimary = true;
+    }
+
+    // check if we have an Email2
+    if(strlen($contactInfo['Email2']) > 0){
+        // if so, add the proper array to our createEmailArray
+        $createEmailArray[] = array(
+            'address' => $contactInfo['Email2'],
+            'rel'     => 'http://schemas.google.com/g/2005#home'
+        );
+
+        if(!$EmailOnePrimary){
+            // if we didn't have an email1, but did have an email2, set email2 as primary
+            $createEmailArray[0]['primary'] = 'true';
+        }
+    }
+
+    // if we had any emails
+    if(count($createEmailArray) > 0){
+        // add them to our base fields array
+        $fields['entry']['gd$email'] = $createEmailArray;
+    }
+
+
+    /****************** fields - phoneNumber **************************/
+    // set a blank array to begin
+    $createPhoneArray = array();
+
+    // check if we have a work number
+    if(strlen($contactInfo['WorkPhone']) > 0){
+        // if so, add the proper array
+        $createPhoneArray[] = array(
+            'rel' => 'http://schemas.google.com/g/2005#work',
+            '$t'  => $contactInfo['WorkPhone']
+        );
+    }
+
+    // check if we have a fax number
+    if(strlen($contactInfo['FaxNumber']) > 0){
+        // if so, add the proper array
+        $createPhoneArray[] = array(
+            'rel' => 'http://schemas.google.com/g/2005#work_fax',
+            '$t'  => $contactInfo['FaxNumber']
+        );
+    }
+
+    // check if we have a home number
+    if(strlen($contactInfo['HomePhone']) > 0){
+        // if so, add the proper array
+        $createPhoneArray[] = array(
+            'rel' => 'http://schemas.google.com/g/2005#home',
+            '$t'  => $contactInfo['HomePhone']
+        );
+    }
+
+    // check if we have a mobile number
+    if(strlen($contactInfo['MobilePhone']) > 0){
+        // if so, add the proper array
+        $createPhoneArray[] = array(
+            'rel' => 'http://schemas.google.com/g/2005#mobile',
+            '$t'  => $contactInfo['MobilePhone']
+        );
+    }
+
+    // if we had any numbers
+    if(count($createPhoneArray) > 0){
+        // add them to our base fields array
+        $fields['entry']['gd$phoneNumber'] = $createPhoneArray;
+    }
+
+
+    // turn it all into JSON
+    $fields = json_encode($fields);
+
+    // open connection
+    $curl = curl_init();
+
+    // set the url, number of POST vars, POST data
+    curl_setopt($curl,CURLOPT_URL,$url);
+    curl_setopt($curl,CURLOPT_POST,count($fields));
+    #curl_setopt($curl,CURLOPT_POSTFIELDS,$fields_string);
+    curl_setopt($curl,CURLOPT_POSTFIELDS,$fields);
+
+    // this let's us put the results into a variable ($curlResult)
+    curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+    // if it goes longer than 3 seconds, kill it
+    curl_setopt($curl, CURLOPT_TIMEOUT, '3');
+    // this turns off ssl thingy, which breaks our current post when left on
+    curl_setopt($curl, CURLOPT_SSL_VERIFYPEER, 0);
+    // our header vars, as described on section 4 of https://developers.google.com/identity/protocols/OpenIDConnect#server-flow
+    curl_setopt($curl, CURLOPT_HTTPHEADER, array(
+        'Authorization: Bearer ' . $accessToken ,
+        'Host: www.googleapis.com',
+        'Content-Type: application/json',
+        'GData-Version: 3.0'
+    ));
+
+    // execute post
+    $curlResult = curl_exec($curl);
+
+    // translate the results into an object
+    $curlObjArray = json_decode($curlResult);
+    //then that object into an array we can read from
+    $curlArray = json_decode(json_encode($curlObjArray),True);
+
+    return $curlArray;
+}
+
+function updateContact($accessToken,$googleContactInfo,$contactInfo){
+    GLOBAL $applicationRoot;
+
+    // our client id and secret are set in settings, so include that file
+    include '/Global/settings.php';
+
+
+    /*****************************************************************************************************************
+    | if the DB Contact is the most recently updated, then override google:
+    |   for each piece of info we might update, see if we have a value for it
+    |   if we don't, then try to pull it from the google data
+    |   after we've gone through each item, run a script to update our blank values with google data
+    |   then take all of our values and run the update on the google data, replacing ALL values
+     ******************************************************************************************************************/
+
+    if(strtotime($contactInfo['LastModified']) > strtotime($googleContactInfo['entry']['updated']['$t'])){
+        // update is the same as create, it requires a given/family/full name to create a "title",
+        // and "getSingleContact" does NOT pull a title.  so if we don't set this manually, it just erases the name
+        $googleContactInfo['entry']['gd$name'] = array(
+            'gd$givenName'  => array(
+                '$t' => $contactInfo['FirstName']
+            ),
+            'gd$familyName' => array(
+                '$t' => $contactInfo['LastName']
+            ),
+            'gd$fullName'   => array(
+                '$t' => $contactInfo['FirstName'] . " " . $contactInfo['LastName']
+            )
+        );
+
+        // work phone
+        // if we didn't already have a work phone for them
+        if(strlen($contactInfo['WorkPhone']) < 1){
+            // grab the first available work number they have, if any
+            if(count($googleContactInfo['entry']['gd$phoneNumber']) > 0){
+                // go through all their numbers
+                foreach($googleContactInfo['entry']['gd$phoneNumber'] AS $googleContactNumber){
+                    // and if they have a work number (not a work_fax number)
+                    if(strpos($googleContactNumber['rel'],'#work') !== false & strpos($googleContactNumber['rel'],'#work_fax') === false){
+                        // add it to our update array
+                        $contactInfo['WorkPhone'] = $googleContactNumber['$t'];
+                        break;
+                    }
+                }
+            }
+        }
+
+        // (work) fax number
+        // if we didn't already have a (work) fax for them
+        if(strlen($contactInfo['FaxNumber']) < 1){
+            // grab the first available (work) fax they have, if any
+            if(count($googleContactInfo['entry']['gd$phoneNumber']) > 0){
+                // go through all their numbers
+                foreach($googleContactInfo['entry']['gd$phoneNumber'] AS $googleContactNumber){
+                    // and if they have a (work) fax number
+                    if(strpos($googleContactNumber['rel'],'#work_fax') !== false){
+                        // add it to our update array
+                        $contactInfo['FaxNumber'] = $googleContactNumber['$t'];
+                        break;
+                    }
+                }
+            }
+        }
+
+        // mobile phone
+        // if we didn't already have a work phone for them
+        if(strlen($contactInfo['MobilePhone']) < 1){
+            // grab the first available work number they have, if any
+            if(count($googleContactInfo['entry']['gd$phoneNumber']) > 0){
+                // go through all their numbers
+                foreach($googleContactInfo['entry']['gd$phoneNumber'] AS $googleContactNumber){
+                    // and if they have a work number (not a work_fax number)
+                    if(strpos($googleContactNumber['rel'],'#mobile') !== false){
+                        // add it to our update array
+                        $contactInfo['MobilePhone'] = $googleContactNumber['$t'];
+                        break;
+                    }
+                }
+            }
+        }
+
+        // home phone
+        // if we didn't already have a home phone for them
+        if(strlen($contactInfo['HomePhone']) < 1){
+            // grab the first available home number they have, if any
+            if(count($googleContactInfo['entry']['gd$phoneNumber']) > 0){
+                // go through all their numbers
+                foreach($googleContactInfo['entry']['gd$phoneNumber'] AS $googleContactNumber){
+                    // and if they have a home number (not a home_fax number)
+                    if(strpos($googleContactNumber['rel'],'#home') !== false & strpos($googleContactNumber['rel'],'#home_fax') === false){
+                        // add it to our update array
+                        $contactInfo['HomePhone'] = $googleContactNumber['$t'];
+                        break;
+                    }
+                }
+            }
+        }
+
+
+        // now that we've updated the DB numbers as needed,
+        // delete the existing gd$phoneNumber array if it exists, and create one of our own
+        unset($googleContactInfo['entry']['gd$phoneNumber']);
+
+        // if we have any numbers, create a new array
+        if(strlen($contactInfo['WorkPhone']) > 0 | strlen($contactInfo['FaxNumber']) > 0 | strlen($contactInfo['MobilePhone']) > 0 | strlen($contactInfo['HomePhone']) > 0) {
+            $googleContactInfo['entry']['gd$phoneNumber'] = array();
+
+            // work phone
+            if(strlen($contactInfo['WorkPhone']) > 0 ){
+                $googleContactInfo['entry']['gd$phoneNumber'][] = array(
+                    'rel' => 'http://schemas.google.com/g/2005#work',
+                    '$t'  => $contactInfo['WorkPhone']
+                );
+            }
+
+            // (work) fax
+            if(strlen($contactInfo['FaxNumber']) > 0 ){
+                $googleContactInfo['entry']['gd$phoneNumber'][] = array(
+                    'rel' => 'http://schemas.google.com/g/2005#work_fax',
+                    '$t'  => $contactInfo['FaxNumber']
+                );
+            }
+
+            // mobile
+            if(strlen($contactInfo['MobilePhone']) > 0 ){
+                $googleContactInfo['entry']['gd$phoneNumber'][] = array(
+                    'rel' => 'http://schemas.google.com/g/2005#mobile',
+                    '$t'  => $contactInfo['MobilePhone']
+                );
+            }
+
+            // home
+            if(strlen($contactInfo['HomePhone']) > 0 ){
+                $googleContactInfo['entry']['gd$phoneNumber'][] = array(
+                    'rel' => 'http://schemas.google.com/g/2005#home',
+                    '$t'  => $contactInfo['HomePhone']
+                );
+            }
+        }
+
+
+        // for company, check if the company name is one we have. if not, take no action
+        if(strlen($contactInfo['EmployerCompanyFK']) < 1){
+            // if there's an organization array
+            if(count($googleContactInfo['entry']['gd$organization']) > 0){
+                // there's only one entry in the array, if any, at spot 0
+                // check if we have this company
+                if(strlen($googleContactInfo['entry']['gd$organization'][0]['gd$orgName']['$t']) > 0){
+                    $SQLQuery = "SELECT CompanyPK FROM company WHERE CompanyName = '" . $googleContactInfo['entry']['gd$organization'][0]['gd$orgName']['$t'] . "'";
+                    include $applicationRoot . 'SQLQuery.php';
+
+                    while($row = mysql_fetch_array($result)){
+                        $contactInfo['EmployerCompanyFK'] = $row['CompanyPK'];
+                        $contactInfo['CompanyName'] = $googleContactInfo['entry']['gd$organization'][0]['gd$orgName']['$t'];
+                    }
+                }
+
+                // see if we already have a job title in contact array
+                if(strlen($contactInfo['JobTitle']) < 1){
+                    // add job title if they have one and we don't, even if there's no company
+                    if(strlen($googleContactInfo['entry']['gd$organization'][0]['gd$orgTitle']['$t']) > 0){
+                        $contactInfo['JobTitle'] = $googleContactInfo['entry']['gd$organization'][0]['gd$orgTitle']['$t'];
+                    }
+                }
+            }
+        }
+
+        // now that we've updated the company info as needed,
+        // delete the existing gd$organization array if it exists, and create one of our own
+        unset($googleContactInfo['entry']['gd$organization']);
+
+        // if we have any numbers, create a new array
+        if(strlen($contactInfo['EmployerCompanyFK']) > 0 | strlen($contactInfo['JobTitle']) > 0) {
+            $googleContactInfo['entry']['gd$organization'] = array(
+                array(
+                    'rel' => 'http://schemas.google.com/g/2005#other'
+                )
+            );
+
+            // company
+            if(strlen($contactInfo['EmployerCompanyFK']) > 0 ){
+                $googleContactInfo['entry']['gd$organization'][0]['gd$orgName'] = array(
+                    // if we have an FK, we have a name in our array, too
+                    '$t' => $contactInfo['CompanyName']
+                );
+            }
+
+            // job title
+            if(strlen($contactInfo['JobTitle']) > 0 ){
+                $googleContactInfo['entry']['gd$organization'][0]['gd$orgTitle'] = array(
+                    '$t' => $contactInfo['JobTitle']
+                );
+            }
+        }
+
+
+        // if Email1 is empty
+        if(strlen($contactInfo['Email1']) < 1){
+            // grab the first available google email, if any
+            if(count($googleContactInfo['entry']['gd$email']) > 0){
+                // loop through the available google emails
+                foreach($googleContactInfo['entry']['gd$email'] AS $googleContactEmail){
+                    // if the email is not the same as Email2
+                    if($googleContactEmail['address'] != $contactInfo['Email2']){
+                        // then set it to the current email
+                        $contactInfo['Email1'] = $googleContactEmail['address'];
+                        // copy the rel, so we don't overwrite this unnecessarily
+                        $contactInfo['Email1Rel'] = $googleContactEmail['rel'];
+                        break;
+                    }
+                }
+            }
+        } else {
+            // if we have an email, see if it matches one of the user's, and copy the rel if so
+            if(count($googleContactInfo['entry']['gd$email']) > 0){
+                // loop through the available google emails
+                foreach($googleContactInfo['entry']['gd$email'] AS $googleContactEmail){
+                    // if the email is the same as Email1
+                    if($googleContactEmail['address'] == $contactInfo['Email1']){
+                        // copy the rel, so we don't overwrite this unnecessarily
+                        $contactInfo['Email1Rel'] = $googleContactEmail['rel'];
+                        break;
+                    }
+                }
+            }
+        }
+
+
+        // if Email2 is empty
+        if(strlen($contactInfo['Email2']) < 1){
+            // if there are any google emails
+            if(count($googleContactInfo['entry']['gd$email']) > 0){
+                // loop through the available google emails
+                foreach($googleContactInfo['entry']['gd$email'] AS $googleContactEmail){
+                    // if the email is not the same as Email1
+                    if($googleContactEmail['address'] != $contactInfo['Email1']){
+                        // then set it to the current email
+                        $contactInfo['Email2'] = $googleContactEmail['address'];
+                        // copy the rel, so we don't overwrite this unnecessarily
+                        $contactInfo['Email2Rel'] = $googleContactEmail['rel'];
+                        break;
+                    }
+                }
+            }
+        } else {
+            // if we have an email, see if it matches one of the user's, and copy the rel if so
+            if(count($googleContactInfo['entry']['gd$email']) > 0){
+                // loop through the available google emails
+                foreach($googleContactInfo['entry']['gd$email'] AS $googleContactEmail){
+                    // if the email is the same as Email2
+                    if($googleContactEmail['address'] == $contactInfo['Email2']){
+                        // copy the rel, so we don't overwrite this unnecessarily
+                        $contactInfo['Email2Rel'] = $googleContactEmail['rel'];
+                        break;
+                    }
+                }
+            }
+        }
+
+        // now that we've updated the DB email info as needed,
+        // delete the existing gd$email array if it exists, and create one of our own
+        unset($googleContactInfo['entry']['gd$email']);
+
+        // if we have any emails, create a new array
+        if(strlen($contactInfo['Email1']) > 0 | strlen($contactInfo['Email2']) > 0) {
+            $googleContactInfo['entry']['gd$email'] = array();
+
+            // email 1
+            if(strlen($contactInfo['Email1']) > 0 ){
+                // set our rel if we have one
+                if(strlen($contactInfo['Email1Rel']) > 0){
+                    $Email1Rel = $contactInfo['Email1Rel'];
+                } else {
+                    // otherwise, default email 1 to work email
+                    $Email1Rel = 'http://schemas.google.com/g/2005#work';
+                }
+
+                $googleContactInfo['entry']['gd$email'][] = array(
+                    'address' => $contactInfo['Email1'],
+                    'primary' => 'true',
+                    'rel'     => $Email1Rel
+                );
+            }
+
+            // email 2
+            if(strlen($contactInfo['Email2']) > 0 ){
+                // set our rel if we have one
+                if(strlen($contactInfo['Email2Rel']) > 0){
+                    $Email2Rel = $contactInfo['Email2Rel'];
+                } else {
+                    // otherwise, default email 1 to home email
+                    $Email2Rel = 'http://schemas.google.com/g/2005#home';
+                }
+
+                // note, we are setting email 1 to primary, not email 2
+                $googleContactInfo['entry']['gd$email'][] = array(
+                    'address' => $contactInfo['Email2'],
+                    'rel'     => $Email2Rel
+                );
+            }
+        }
+
+        // now that we've updated our contact array to fill in blanks, run an update script
+        // (if there were no blanks, this will have no affect, which is fine
+        // set blanks to NULL
+
+        foreach($contactInfo AS $key=>$value){
+            if(strlen($value) < 1){
+                $contactInfo[$key] = "NULL";
+            } else {
+                // some of our values may have already been set to NULL
+                if($contactInfo[$key] != "NULL"){
+                    // don't add quotes to the GoogleContactID
+                    if($key != 'GoogleContactID'){
+                        $contactInfo[$key] = "'" . $contactInfo[$key] . "'";
+                    }
+                }
+            }
+        }
+
+        $SQLQuery = "UPDATE entity e JOIN person p ON e.EntityPK = p.EntityFK SET
+            e.WorkPhone = {$contactInfo['WorkPhone']},
+            e.FaxNumber = {$contactInfo['FaxNumber']},
+            p.HomePhone = {$contactInfo['HomePhone']},
+            p.MobilePhone = {$contactInfo['MobilePhone']},
+            p.EmployerCompanyFK = {$contactInfo['EmployerCompanyFK']},
+            p.JobTitle = {$contactInfo['JobTitle']},
+            p.Email1 = {$contactInfo['Email1']},
+            p.Email2 = {$contactInfo['Email2']}
+            WHERE EntityPK = {$contactInfo['EntityPK']};
+        ";
+        include $applicationRoot . 'SQLQuery.php';
+
+
+        // now that we have filled in any blanks we had, update this contact's info to have our info
+
+        //https://developers.google.com/google-apps/contacts/v3/#updating_contacts
+        GLOBAL $google_API_client_id;
+        GLOBAL $google_API_client_secret;
+        //https://developers.google.com/google-apps/contacts/v3/#creating_contacts
+        // https://www.google.com/m8/feeds/contacts/userEmail/full/{contactId}
+        $url = "https://www.google.com/m8/feeds/contacts";
+
+        // append our user's email
+        $UserEmail = urlencode($_SESSION['UserEmail']);
+        $url .= "/{$UserEmail}";
+
+        // add "full" and contact id
+        $url .= "/full/{$contactInfo['GoogleContactID']}";
+
+        // turn back into JSON
+        $googleContactInfo = json_encode($googleContactInfo);
+
+        // open connection
+        $curl = curl_init();
+
+        // set the url, number of POST vars, POST data
+        curl_setopt($curl,CURLOPT_URL,$url);
+
+        // this let's us put the results into a variable ($curlResult)
+        curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+        // if it goes longer than 3 seconds, kill it
+        curl_setopt($curl, CURLOPT_TIMEOUT, '3');
+        // this turns off ssl thingy, which breaks our current post when left on
+        curl_setopt($curl, CURLOPT_SSL_VERIFYPEER, 0);
+        // make this a PUT request
+        curl_setopt($curl, CURLOPT_CUSTOMREQUEST, "PUT");
+        // add the data
+        #curl_setopt($curl, CURLOPT_POSTFIELDS,http_build_query($data));
+        curl_setopt($curl, CURLOPT_POSTFIELDS,$googleContactInfo);
+
+        // our header vars, as described on section 4 of https://developers.google.com/identity/protocols/OpenIDConnect#server-flow
+
+        curl_setopt($curl, CURLOPT_HTTPHEADER, array(
+            'Authorization: Bearer ' . $accessToken ,
+            'Host: www.googleapis.com',
+            'Content-Type: application/json',
+            'GData-Version: 3.0',
+            'If-Match: *'
+        ));
+
+
+        // execute post
+        $curlResult = curl_exec($curl);
+
+        return $curlResult;
+    } else {
+        /**************************************************************************************************************************
+        |  If the Google Contact was updated most recently, not the DB version, then we are overwriting our data with Google data
+        |
+         ***************************************************************************************************************************/
+
+        // begin building our sql query.  We're only overwriting where google has values (so that blanks do not overwrite data we have)
+        $UpdateSQLQuery = "UPDATE entity e JOIN person p ON EntityPK = EntityFK SET ";
+        // go through all the google phone numbers.  for the first of each type (work, work_fax, home, mobile) add it to our update array
+        $firstWork = $firstFax = $firstHome = $firstMobile = false;
+        foreach($googleContactInfo['entry']['gd$phoneNumber'] AS $googleContactNumber){
+            // work
+            if(strpos($googleContactNumber['rel'],'#work') !== false & strpos($googleContactNumber['rel'],'#work_fax') === false & $firstWork == false) {
+                $UpdateSQLQuery .= "WorkPhone = '{$googleContactNumber['$t']}',";
+                $firstWork = true;
+            }
+
+            // fax
+            if(strpos($googleContactNumber['rel'],'#work_fax') !== false & $firstFax == false){
+                $UpdateSQLQuery .= "FaxNumber = '{$googleContactNumber['$t']}',";
+                $firstFax = true;
+            }
+
+            // home
+            if(strpos($googleContactNumber['rel'],'#home') !== false & strpos($googleContactNumber['rel'],'#home_fax') === false & $firstHome == false){
+                $UpdateSQLQuery .= "HomePhone = '{$googleContactNumber['$t']}',";
+                $firstHome = true;
+            }
+
+            // mobile
+            if(strpos($googleContactNumber['rel'],'#mobile') !== false & $firstMobile == false){
+                $UpdateSQLQuery .= "MobilePhone = '{$googleContactNumber['$t']}',";
+                $firstMobile = true;
+            }
+        }
+
+        // go through all the google emails.  the first we find will be email1, the second we find will be email 2, then we stop searching
+        $firstEmail = false;
+        foreach($googleContactInfo['entry']['gd$email'] AS $googleContactEmail){
+            // email1
+            if(!$firstEmail){
+                $UpdateSQLQuery .= "Email1 = '{$googleContactEmail['address']}',";
+                $firstEmail = true;
+            } else {
+                $UpdateSQLQuery .= "Email2 = '{$googleContactEmail['address']}',";
+                break;
+            }
+        }
+
+        // if they have a company, get the first company they have and check against the first company we have with an identical name
+        if(strlen($googleContactInfo['entry']['gd$organization'][0]['gd$orgName']['$t']) > 0){
+            $SQLQuery = "SELECT CompanyPK FROM company WHERE CompanyName = '{$googleContactInfo['entry']['gd$organization'][0]['gd$orgName']['$t']}' LIMIT 1";
+            include $applicationRoot . 'SQLQuery.php';
+
+            // if we found a matching company
+            while($row = mysql_fetch_array($result)){
+                // then add it to our update array
+                $UpdateSQLQuery .= "EmployerCompanyFK = {$row['CompanyPK']},";
+            }
+        }
+
+        // add their job title, if they have one
+        if(strlen($googleContactInfo['entry']['gd$organization'][0]['gd$orgTitle']['$t']) > 0){
+            $UpdateSQLQuery .= "JobTitle = '{$googleContactInfo['entry']['gd$organization'][0]['gd$orgTitle']['$t']}',";
+        }
+
+
+
+        $SQLQuery = rtrim($UpdateSQLQuery,",");
+        // add a where clause
+        $SQLQuery .= " WHERE EntityFK = {$contactInfo['EntityPK']}";
+
+        // char count is initially 57, so we're checking against 60
+        if(strlen($SQLQuery) > 80){
+            include $applicationRoot . 'SQLQuery.php';
+        }
+
+        return 0;
+    }
+}
+
+
+// this function is used for helping to compare two strings
+function baseString($string){
+    // make everything lowercase
+    $string = strtolower($string);
+    // remove all whitespace
+    $string = str_replace(' ','',$string);
+    // remove all apostrophes
+    $string = str_replace("'",'',$string);
+
+    return $string;
+}
+
+// this function is used for helping to compare two phone numbers
+function basePhone($number){
+    // we only want the numbers of the phone number
+    $number = preg_replace('/\D/','',$number);
+
+    return $number;
+}
+
+function firstLast($name){
+    $nameResults = array();
+    $nameReturn = array();
+    $DisplayName = $name;
+
+    preg_match('#^(\w+\.)?\s*([\'\'\w]+)\s+([\'\'\w]+)\s*(\w+\.?)?$#', $DisplayName, $nameResults);
+
+    $nameReturn['FirstName'] = $nameResults[2];
+    $nameReturn['LastName'] = $nameResults[3];
+
+    if (strlen($nameResults[4]) > 0)
+    {
+        $nameReturn['FirstName'] .= " ". $nameResults[4];
+    }
+
+    return $nameReturn;
+}
